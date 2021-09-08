@@ -1,0 +1,190 @@
+## This module contains whole process of ETL for reading json files,processing them into one fact table and 4 dimension tables
+
+#importing needed libraries 
+import configparser
+from datetime import datetime
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col
+from pyspark.sql.functions import year, month, dayofmonth, hour, weekofyear, date_format
+
+# Reading configuration parameters that can be found in dl.cfg file in this workspace
+config = configparser.ConfigParser()
+config.read('dl.cfg')
+input_data_song = config.get('IO', 'INPUT_DATA_SONG')
+input_data_log = config.get('IO', 'INPUT_DATA_LOG')
+output_data = config.get('IO', 'OUTPUT_DATA')
+    
+#parameter to connect to AWS
+os.environ['AWS_ACCESS_KEY_ID']=config['AWS']['AWS_ACCESS_KEY_ID']
+os.environ['AWS_SECRET_ACCESS_KEY']=config['AWS']['AWS_SECRET_ACCESS_KEY']
+    
+# Function defining Spark session
+def create_spark_session():
+    spark = SparkSession \
+        .builder \
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:2.7.0") \
+        .getOrCreate()
+    return spark
+
+#Function which load song data, read its json content, place it in analitics' tables: songs_table & artists_table
+def process_song_data(spark, input_data_song, output_data):
+    # get filepath to song data file
+    #song_data = 'song_data/A/*/*/*.json'
+    song_data=input_data_song
+    
+    # read song data file
+    #df_songs = spark.read.json(os.path.join(input_data,song_data),multiLine=True)
+    df_songs = spark.read.json(song_data,multiLine=True)
+    
+    
+    # extract columns to create songs table
+    #song_id, title, artist_id, year, duration
+    songs_table = df_songs.select(["song_id", "title", "artist_id", "year", "duration"]).dropDuplicates()
+    
+    # write songs table to parquet files partitioned by year and artist
+    songs_table.write.partitionBy("year","artist_id") \
+                .parquet(os.path.join(output_data,'songs'),'overwrite')
+                        
+
+    # extract columns to create artists table
+    artists_table = df_songs.select(["artist_id", "artist_name", "artist_location", "artist_latitude", "artist_longitude"]) \
+                .dropDuplicates()
+    artists_table.withColumnRenamed("artist_name","name")
+    artists_table.withColumnRenamed("artist_latitude","latitude")
+    artists_table.withColumnRenamed("artist_longitude","longitude")
+    
+    # write artists table to parquet files
+    artists_table.write.parquet(os.path.join(output_data,'artists'),'overwrite')
+
+    
+    
+#Function which load log & song data, read its json content, place it in analitics' tables: users_table & time_table & songplays_table
+def process_log_data(spark, input_data_song, input_data_log, output_data):
+    
+    # get filepath to song data file which will be needed for songplay
+    #song_data = 'song_data/A/*/*/*.json'
+    song_data=input_data_song
+    
+    # read again song data file 
+    #df_songs = spark.read.json(os.path.join(input_data,song_data),multiLine=True)
+    df_songs = spark.read.json(song_data,multiLine=True)
+    
+    # get filepath to log data file
+    #log_data ='s3://udacity-dend/log_data/*.json'
+    log_data=input_data_log
+
+    # read log data file
+    #df=spark.read.json(os.path.join(input_data,log_data),multiLine=True)
+    df=spark.read.json(input_data_log,multiLine=True)
+    
+    # filter by actions for song plays
+    df = df.filter(df.page=="NextSong")
+
+    
+    # USERS
+    # extract columns for users table    
+    users_table = df.select(["userid", "firstname", "lastname", "gender", "level"]).dropDuplicates()
+    users_table=users_table.withColumnRenamed("userid", "user_id")
+    users_table=users_table.withColumnRenamed("firstname", "first_name")
+    users_table=users_table.withColumnRenamed("lastname", "last_name")
+    
+    # write users table to parquet files 
+    users_table.write.parquet(os.path.join(output_data,'users'), 'overwrite')
+
+    
+    # TIME
+    # extract columns to create time table
+    #start_time, hour, day, week, month, year, weekday
+    df.select('ts').createOrReplaceTempView("time")
+
+    time_table=spark.sql(""" 
+            select 
+            ts/1000/60/60 as start_time
+            ,extract(hour from to_timestamp(ts/1000)) as hour
+            ,extract(day from to_timestamp(ts/1000)) as day
+            ,extract(week from to_timestamp(ts/1000)) as week
+            ,extract(month from to_timestamp(ts/1000)) as month
+            ,extract(year from to_timestamp(ts/1000)) as year
+            ,dayofweek(to_timestamp(ts/1000)) as weekday
+            from time
+            """) 
+    
+    time_table.dropDuplicates()
+    
+    # write time table to parquet files partitioned by year and month  
+    time_table.write.partitionBy("year","month").parquet(os.path.join(output_data,'time'), 'overwrite')
+
+    
+    # SONGPLAYS
+    #  create temp view with logs data to use for songplays table
+    df_songs.createOrReplaceTempView("temp_songs")
+    
+    # adding autoincremantal id to logs data before joining with songs
+    #choosing only needed columns
+    df = df.select("ts", "userId", "level", "sessionId", "location", "useragent", "artist", "song","page")
+                   
+                   
+    # use zipWithIndex to add the indexes - using this method slow down the performance. but not as bad as rownumber()
+    dfrdd = df.rdd.zipWithIndex()
+    
+    # get back to a dataframe
+    df_logs = dfrdd.toDF()
+    df_logs=df_logs.withColumn('ts', df_logs['_1'].getItem("ts"))
+    df_logs=df_logs.withColumn('userId', df_logs['_1'].getItem("userId"))
+    df_logs=df_logs.withColumn('level', df_logs['_1'].getItem("level"))
+    df_logs=df_logs.withColumn('sessionId', df_logs['_1'].getItem("sessionId"))
+    df_logs=df_logs.withColumn('location', df_logs['_1'].getItem("location"))
+    df_logs=df_logs.withColumn('useragent', df_logs['_1'].getItem("useragent"))
+    df_logs=df_logs.withColumn('artist', df_logs['_1'].getItem("artist"))
+    df_logs=df_logs.withColumn('song', df_logs['_1'].getItem("song"))
+    df_logs=df_logs.withColumn('page', df_logs['_1'].getItem("page"))
+    
+    df_logs=df_logs.select("_2", "ts", "userId", "level", "sessionId", "location", "useragent", "artist", "song", "page")
+    
+    #renaming column 
+    df_logs=df_logs.withColumnRenamed("_2", "songplay_id")
+  
+    # create temp view with logs data
+    df_logs.createOrReplaceTempView("temp_logs")
+    
+    # extract columns from joined song and log datasets to create songplays table 
+    songplays_table =  spark.sql ("""
+                        SELECT
+                            songplay_id
+                            ,l.ts/1000/60/60 as start_time
+                            , l.userId as user_id
+                            , l.level
+                            , s.song_id
+                            , s.artist_id
+                            , l.sessionid as session_id
+                            , l.location
+                            , l.useragent as user_agent
+                            , extract(month from to_timestamp(ts/1000)) as month
+                            , extract(year from to_timestamp(ts/1000)) as year
+                        FROM temp_logs l 
+                        LEFT JOIN temp_songs s 
+                        ON (l.artist = s.artist_name AND l.song = s.title) 
+                        WHERE
+                            page='NextSong'""")
+
+    
+    # write songplays table to parquet files partitioned by year and month 
+    songplays_table.write.partitionBy("year","month").parquet(os.path.join(output_data,'songplays'), 'overwrite')
+
+# This is main function which calls other functions    
+def main(): 
+    
+    #calling function that defines spark session
+    spark = create_spark_session()
+    
+    #call function with spark session which process song data from input folder, transform it and place it in output folder
+    process_song_data(spark, input_data_song, output_data)    
+    
+    #call function with spark session which process log&song data from input folder, transform it and place it in output folder
+    process_log_data(spark, input_data_song, input_data_log, output_data)
+
+
+# Calling main function
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+[AWS]
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+
+[IO]
+#input_data = "s3a://udacity-dend/"
+input_data='/home/workspace/data/'
+input_data_song='/home/workspace/data/song_test/song_data/A/*/*/*.json'
+input_data_log='/home/workspace/data/log_test/*.json'
+output_data = '/home/workspace/data/out/'
